@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+# dogfooding installs of the skill must not be committed
+.agents/
+.claude/skills/
+skills-lock.json

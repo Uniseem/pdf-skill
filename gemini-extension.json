@@ -1,0 +1,5 @@
+{
+  "name": "pdf-skill",
+  "version": "0.1.0",
+  "description": "Document library skill: MinerU + LLM ingest into strict Markdown, BM25 search, layout-preserving PDF translation."
+}

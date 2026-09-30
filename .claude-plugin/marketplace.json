@@ -1,0 +1,12 @@
+{
+  "name": "pdf-skill",
+  "description": "pdf-skill: document ingest (MinerU + LLM), BM25 search and layout-preserving PDF translation for agents.",
+  "owner": { "name": "Uniseem" },
+  "plugins": [
+    {
+      "name": "pdf-skill",
+      "source": "./",
+      "description": "Ingest documents into a flat git Markdown library, search it with BM25, translate PDFs with layout preserved."
+    }
+  ]
+}

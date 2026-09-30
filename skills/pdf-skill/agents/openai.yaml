@@ -1,0 +1,6 @@
+interface:
+  display_name: "PDF Skill"
+  short_description: "Ingest, search and translate documents in a git Markdown library"
+  default_prompt: "Ingest this PDF into my document library and summarise its sections."
+policy:
+  allow_implicit_invocation: true
