@@ -145,25 +145,37 @@ class ResolvedLLM:
         return f"{self.provider}/{self.model}"
 
 
-def detect_provider() -> str | None:
-    """Pick the first provider whose API key is present in the environment."""
+def _key_for(profile: Provider, keys: dict[str, str] | None) -> str | None:
+    """Provider key: environment first, then the config files' [keys] table."""
+    for k in profile.key_env:
+        if os.environ.get(k):
+            return os.environ[k]
+    for k in profile.key_env:
+        if (keys or {}).get(k):
+            return keys[k]
+    return None
+
+
+def detect_provider(keys: dict[str, str] | None = None) -> str | None:
+    """Pick the first provider whose API key is in the environment or the config [keys] table."""
     for name, p in PROVIDERS.items():
         if name in LOCAL_PROVIDERS or name.endswith("-intl") or name == "zai":
             continue
-        if any(os.environ.get(k) for k in p.key_env):
+        if _key_for(p, keys):
             return name
     return None
 
 
 def resolve(settings) -> ResolvedLLM | None:
     """Resolve LLM settings (``pdfskill.config.LLMSettings``); None when nothing is configured."""
-    name = settings.provider or (None if settings.base_url else detect_provider())
+    keys = getattr(settings, "keys", None) or {}
+    name = settings.provider or (None if settings.base_url else detect_provider(keys))
     if name is None and not settings.base_url:
         return None
     profile = PROVIDERS.get(name or "", GENERIC)
     if name and name not in PROVIDERS and not settings.base_url:
         raise LLMError(f"unknown provider {name!r}; known: {', '.join(PROVIDERS)} (or set base_url)")
-    key = settings.api_key or next((os.environ[k] for k in profile.key_env if os.environ.get(k)), None)
+    key = settings.api_key or _key_for(profile, keys)
     if not key and (name in LOCAL_PROVIDERS):
         key = "local"
     model = settings.model or profile.default_model
@@ -181,7 +193,9 @@ class LLM:
 
         if not resolved.api_key:
             envs = " or ".join(resolved.profile.key_env) or "PDFSKILL_LLM_API_KEY"
-            raise LLMError(f"no API key for {resolved.provider}: set {envs} (or llm.api_key in the config file)")
+            raise LLMError(
+                f"no API key for {resolved.provider}: set {envs}, or run `pdfskill config set keys.{envs.split()[0]} -`"
+            )
         self.r = resolved
         self.temperature = temperature
         self.client = OpenAI(base_url=resolved.base_url, api_key=resolved.api_key, max_retries=5, timeout=timeout)

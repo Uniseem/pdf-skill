@@ -58,9 +58,22 @@ RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 ProgressFn = Callable[[str], None]
 
 
+HINTS = {
+    "retry_limit_exceeded": "the anonymous API allows only a few parses of the same file; set MINERU_TOKEN "
+    "(pdfskill config set mineru.token -) to use the v4 API",
+    "-60018": "daily MinerU task limit reached; try again tomorrow",
+    "-60005": "file larger than 200 MB",
+    "-60006": "too many pages (max 200): split with --pages",
+    "A0211": "MinerU token expired: create a new one at https://mineru.net/apiManage/token",
+    "A0202": "MinerU token invalid",
+}
+
+
 class MinerUError(RuntimeError):
     def __init__(self, message: str, code: object = None):
-        super().__init__(f"MinerU error {code}: {message}" if code is not None else message)
+        text = f"MinerU error {code}: {message}" if code is not None else message
+        hint = HINTS.get(str(code)) or next((h for k, h in HINTS.items() if k in str(message)), None)
+        super().__init__(f"{text} ({hint})" if hint else text)
         self.code = code
 
 

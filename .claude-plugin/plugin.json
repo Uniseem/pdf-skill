@@ -1,6 +1,6 @@
 {
   "name": "pdf-skill",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Document library skill: MinerU + LLM ingest into strict hierarchical Markdown in a flat git repo, BM25 search, and layout-preserving PDF translation (retain-pdf).",
   "author": { "name": "Uniseem" },
   "homepage": "https://github.com/Uniseem/pdf-skill",

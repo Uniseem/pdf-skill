@@ -1,6 +1,6 @@
 [project]
 name = "pdfskill"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent skill: ingest any document into a flat, git-friendly Markdown library (MinerU + LLM), BM25 search, and layout-preserving PDF translation (retain-pdf)."
 readme = "README.md"
 license = "MIT"

@@ -36,6 +36,7 @@ class IngestOptions:
     force: bool = False
     reparse: bool = False
     commit: bool = True
+    push: bool = True
     page_ranges: str | None = None
     language: str | None = None
     is_ocr: bool | None = None
@@ -368,8 +369,9 @@ def ingest(lib: Library, path: Path, settings: Settings, opts: IngestOptions, pr
     SearchIndex(lib.chunks_dir, lib.cache_dir / "bm25").build()
     if opts.commit:
         verb = "ingest" if need_ingest else f"translate({lang})"
-        sha_c = lib.commit(f"{verb}: {title} ({doc_id})", sorted(set(touched)))
+        sha_c = lib.commit(f"{verb}: {title} ({doc_id})", sorted(set(touched)), push=opts.push)
         result["commit"] = sha_c
+        result["push"] = lib.last_push
     return result
 
 

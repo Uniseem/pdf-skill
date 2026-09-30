@@ -11,15 +11,28 @@ from pathlib import Path
 
 from . import __version__
 from . import translate as tr
-from .config import config_path, load_settings
+from .config import (
+    LIBRARY_CONFIG,
+    LIBRARY_CONFIG_HEADER,
+    ConfigError,
+    _coerce,
+    config_path,
+    is_secret,
+    load_settings,
+    set_value,
+    unset_value,
+    validate_key,
+)
 from .library import Library, LibraryError
-from .llm import PROVIDERS, LLMError, resolve
+from .llm import PROVIDERS, LLMError, _key_for, resolve
+from .privacy import PrivacyError
 
 EXIT_OK, EXIT_ERR, EXIT_USAGE, EXIT_PARTIAL = 0, 1, 2, 3
 GUIDE = Path(__file__).parent / "guide.md"
 
 CONFIG_TEMPLATE = """\
-# pdfskill user config (secrets allowed here; never put them in the library repo)
+# pdfskill user config: per machine, never pushed. Library-wide settings and keys
+# can instead live in <library>/.pdfskill/config.toml (`pdfskill config set ...`).
 
 [library]
 # path = "~/pdfskill-library"
@@ -36,6 +49,9 @@ CONFIG_TEMPLATE = """\
 # api_key = ""          # or the provider's env var (DEEPSEEK_API_KEY, DASHSCOPE_API_KEY, ...)
 # base_url = ""         # any OpenAI-compatible endpoint
 # concurrency = 4
+
+[keys]
+# DEEPSEEK_API_KEY = "" # provider keys by env-var name (used when the env var is unset)
 
 [translate]
 # target_lang = "zh"
@@ -63,6 +79,21 @@ def _lib(args, settings) -> Library:
     return Library.find(Path(args.library) if args.library else None, settings.library)
 
 
+def _guarded(args, settings) -> Library:
+    """The library, after refusing to work on one with a publicly readable remote."""
+    lib = _lib(args, settings).require()
+    for st in lib.guard():
+        if st.status == "unknown":
+            print(f"warning: could not verify that remote {st.name} is private ({st.detail})", file=sys.stderr)
+    return lib
+
+
+def _push_text(p: dict | None) -> str:
+    if not p:
+        return "no remote"
+    return f"pushed to {p['remote']}" if p.get("pushed") else f"not pushed: {p.get('reason')}"
+
+
 def _mask(v: str | None) -> str | None:
     if not v:
         return None
@@ -75,12 +106,48 @@ def _mask(v: str | None) -> str | None:
 def cmd_init(args, settings) -> int:
     lib = _lib(args, settings)
     created = lib.init(git=not args.no_git)
-    _out(
-        args,
-        {"library": str(lib.root), "created": created},
-        f"library: {lib.root}\ncreated: {', '.join(created) or 'nothing (already initialised)'}",
-    )
+    data: dict = {"library": str(lib.root), "created": created}
+    text = f"library: {lib.root}\ncreated: {', '.join(created) or 'nothing (already initialised)'}"
+    if args.github or args.remote:
+        res = _add_remote(lib, args.remote, args.github)
+        data["remote"] = res
+        text += f"\nremote: {res['url']} (private; {_push_text(res['push'])})"
+    _out(args, data, text)
     return EXIT_OK
+
+
+def _add_remote(lib: Library, url: str | None, github: str | None, name: str = "origin") -> dict:
+    import shutil
+    import subprocess
+
+    if github:
+        gh = shutil.which("gh")
+        if not gh:
+            raise LibraryError("--github needs the GitHub CLI (gh); or create a private repo and use --remote URL")
+        view = subprocess.run(
+            [gh, "repo", "view", github, "--json", "visibility", "--jq", ".visibility"], capture_output=True, text=True
+        )
+        if view.returncode == 0:
+            if view.stdout.strip().lower() != "private":
+                raise PrivacyError(f"{github} exists and is {view.stdout.strip().lower()}; a library must be private")
+        else:
+            proc = subprocess.run(
+                [
+                    gh,
+                    "repo",
+                    "create",
+                    github,
+                    "--private",
+                    "--description",
+                    "pdfskill document library (private: contains API keys)",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0:
+                raise LibraryError(f"gh repo create failed: {proc.stderr.strip()[-300:]}")
+        url = f"https://github.com/{github}.git"
+    return lib.add_remote(url, name)
 
 
 def cmd_doctor(args, settings) -> int:
@@ -131,7 +198,17 @@ def cmd_doctor(args, settings) -> int:
         report["llm"] = {"error": str(exc)}
     report["translate"] = tr.status()
     report["tools"] = {"git": bool(shutil.which("git")), "uv": bool(shutil.which("uv"))}
+    report["remotes"] = [s.as_dict() for s in lib.privacy_status(fresh=True)] if lib.exists and lib.is_git else []
+    report["secret_sources"] = {k: v for k, v in settings.sources.items() if is_secret(k)}
     problems = []
+    for rm in report["remotes"]:
+        if rm["status"] == "public":
+            problems.append(
+                f"remote {rm['name']} ({rm['url']}) is PUBLIC: pdfskill refuses to run on this library; make it "
+                "private, and rotate any keys that were pushed"
+            )
+        elif rm["status"] == "unknown":
+            problems.append(f"remote {rm['name']} could not be verified as private ({rm['detail']})")
     if not lib.exists:
         problems.append("library not initialised: run `pdfskill init`")
     if not m.token:
@@ -153,6 +230,8 @@ def cmd_doctor(args, settings) -> int:
             + (f" ({mineru['token_days_left']} days left)" if "token_days_left" in mineru else ""),
             f"llm:       {json.dumps(report['llm'], ensure_ascii=False)}",
             f"translate: {'ready' if report['translate']['ready'] else 'not set up'}",
+            "remotes:   "
+            + (", ".join(f"{rm['name']}={rm['status']}" for rm in report["remotes"]) or "none (local only)"),
         ]
         lines += [f"- {p}" for p in problems] or ["all good"]
         print("\n".join(lines))
@@ -160,8 +239,9 @@ def cmd_doctor(args, settings) -> int:
 
 
 def cmd_config(args, settings) -> int:
-    path = config_path()
-    if args.init:
+    action = args.action
+    if action == "init":
+        path = config_path()
         if path.exists():
             print(f"{path} already exists", file=sys.stderr)
         else:
@@ -170,17 +250,22 @@ def cmd_config(args, settings) -> int:
             os.chmod(path, 0o600)
         _out(args, {"config_file": str(path)}, str(path))
         return EXIT_OK
+    if action in {"set", "unset"}:
+        return _config_write(args, settings)
     r = None
     try:
         r = resolve(settings.llm)
     except LLMError:
         pass
+    src = settings.sources
     data = {
-        "config_file": str(path),
+        "config_file": str(config_path()),
+        "library_config": str(settings.library_config) if settings.library_config else None,
         "library": str(settings.library) if settings.library else None,
         "mineru": {
             "api": settings.mineru.api,
             "token": _mask(settings.mineru.token),
+            "token_from": src.get("mineru.token"),
             "model_version": settings.mineru.model_version,
             "language": settings.mineru.language,
         },
@@ -191,10 +276,90 @@ def cmd_config(args, settings) -> int:
             "api_key": _mask(r.api_key) if r else None,
             "concurrency": settings.llm.concurrency,
         },
+        "keys": {k: _mask(v) for k, v in settings.llm.keys.items()},
         "translate": {"target_lang": settings.target_lang, "home": str(tr.data_home())},
     }
     _out(args, data)
     return EXIT_OK
+
+
+def _config_write(args, settings) -> int:
+    action = args.action
+    if not args.key:
+        raise ConfigError(f"usage: pdfskill config {action} KEY" + (" VALUE" if action == "set" else ""))
+    validate_key(args.key, library=not args.user)
+    value = None
+    if action == "set":
+        if args.value is None:
+            raise ConfigError("usage: pdfskill config set KEY VALUE   (VALUE '-' reads it from stdin)")
+        raw = sys.stdin.readline().strip() if args.value == "-" else args.value
+        if not raw:
+            raise ConfigError("empty value")
+        value = _coerce(args.key, raw)
+    shown = _mask(str(value)) if value is not None and is_secret(args.key) else value
+    if args.user:
+        path = config_path()
+        if action == "set":
+            set_value(path, args.key, value)
+            changed = True
+        else:
+            changed = unset_value(path, args.key)
+        _out(
+            args,
+            {"file": str(path), "key": args.key, "value": shown, "changed": changed},
+            f"{action} {args.key} in {path}",
+        )
+        return EXIT_OK
+    lib = _lib(args, settings).require()
+    lib.guard(strict=True)  # the value goes into the repository: every remote must be verified private now
+    path = lib.root / LIBRARY_CONFIG
+    if action == "set":
+        set_value(path, args.key, value, header=LIBRARY_CONFIG_HEADER)
+        changed = True
+    else:
+        changed = unset_value(path, args.key, header=LIBRARY_CONFIG_HEADER)
+    sha = None
+    if changed and not args.no_commit:
+        sha = lib.commit(f"config: {action} {args.key}", [str(LIBRARY_CONFIG)], push=not args.no_push)
+    data = {
+        "file": lib.rel(path),
+        "key": args.key,
+        "value": shown,
+        "changed": changed,
+        "commit": sha,
+        "push": lib.last_push,
+    }
+    text = f"{action} {args.key}" + (f" = {shown}" if action == "set" else "") + f" in {lib.rel(path)}"
+    if sha:
+        text += f" (commit {sha}; {_push_text(lib.last_push)})"
+    _out(args, data, text)
+    return EXIT_OK
+
+
+def cmd_remote(args, settings) -> int:
+    lib = _lib(args, settings).require()
+    if args.action == "status":
+        rows = [s.as_dict() for s in lib.privacy_status(fresh=True)]
+        text = "\n".join(f"{rm['name']:<10} {rm['status']:<8} {rm['url']}  ({rm['method']})" for rm in rows)
+        _out(args, rows, text or "no remotes (local-only library)")
+        return EXIT_OK if all(rm["status"] in {"private", "local"} for rm in rows) else EXIT_ERR
+    if not args.target:
+        raise LibraryError("usage: pdfskill remote add URL | pdfskill remote create OWNER/NAME")
+    if args.action == "add":
+        res = _add_remote(lib, args.target, None, args.name)
+    else:
+        if "/" not in args.target:
+            raise LibraryError("usage: pdfskill remote create OWNER/NAME   (creates a private GitHub repo via gh)")
+        res = _add_remote(lib, None, args.target, args.name)
+    _out(args, res, f"remote {res['remote']} = {res['url']} (private; {_push_text(res['push'])})")
+    return EXIT_OK
+
+
+def cmd_sync(args, settings) -> int:
+    lib = _lib(args, settings).require()
+    res = lib.sync()
+    _out(args, res, ("pulled, " if res["pulled"] else "") + _push_text(res["push"]))
+    return EXIT_OK if res["push"].get("pushed") else EXIT_ERR
 
 
 def cmd_providers(args, settings) -> int:
@@ -204,7 +369,7 @@ def cmd_providers(args, settings) -> int:
             "base_url": p.base_url,
             "key_env": list(p.key_env),
             "default_model": p.default_model,
-            "key_set": any(os.environ.get(k) for k in p.key_env),
+            "key_set": bool(_key_for(p, settings.llm.keys)),
             "note": p.note,
         }
         for n, p in PROVIDERS.items()
@@ -218,7 +383,7 @@ def cmd_providers(args, settings) -> int:
         rows,
         "provider          key default model                  env var\n"
         + text
-        + "\n(* = key found in environment; any other OpenAI-compatible endpoint: set llm.base_url + llm.model)",
+        + "\n(* = key found in env or config; any other OpenAI-compatible endpoint: set llm.base_url + llm.model)",
     )
     return EXIT_OK
 
@@ -257,7 +422,7 @@ def cmd_ingest(args, settings) -> int:
     lib = _lib(args, settings)
     if not lib.exists and args.init:
         lib.init()
-    lib.require()
+    lib = _guarded(args, settings)
     lang = args.translate if args.translate is not None else None
     if lang == "":
         lang = settings.target_lang
@@ -267,6 +432,7 @@ def cmd_ingest(args, settings) -> int:
         force=args.force,
         reparse=args.reparse,
         commit=not args.no_commit,
+        push=not args.no_push,
         page_ranges=args.pages,
         language=args.lang,
         is_ocr=True if args.ocr else None,
@@ -315,6 +481,8 @@ def cmd_ingest(args, settings) -> int:
             if r.get("translation"):
                 t = r["translation"]
                 print(f"          translated: {t['pdf']}  {t['markdown']}")
+            if r.get("push"):
+                print(f"          {_push_text(r['push'])}")
     if failed and failed == len(results):
         return EXIT_ERR
     return EXIT_PARTIAL if failed else EXIT_OK
@@ -331,7 +499,7 @@ def cmd_translate(args, settings) -> int:
 def cmd_search(args, settings) -> int:
     from .search import SearchIndex
 
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     doc_ids = [lib.resolve_id(d) for d in args.doc] if args.doc else None
     lang = {"orig": None, "any": "any"}.get(args.in_lang, args.in_lang)
     res = SearchIndex(lib.chunks_dir, lib.cache_dir / "bm25").search(
@@ -367,7 +535,7 @@ def cmd_search(args, settings) -> int:
 def cmd_locate(args, settings) -> int:
     from .query import locate
 
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     doc_ids = [lib.resolve_id(d) for d in args.doc] if args.doc else None
     hits = locate(lib, args.query, doc_ids=doc_ids, kind=args.type, limit=args.n)
     if args.json:
@@ -384,7 +552,7 @@ def cmd_locate(args, settings) -> int:
 def cmd_get(args, settings) -> int:
     from .query import get
 
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     chunk = args.chunk or (args.doc if "#" in args.doc else None)
     ref = args.doc.split("#", 1)[0].split(".", 1)[0] if "#" in args.doc else args.doc
     doc_id = lib.resolve_id(ref)
@@ -416,7 +584,7 @@ def cmd_get(args, settings) -> int:
 def cmd_outline(args, settings) -> int:
     from .query import outline
 
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     res = outline(lib, lib.resolve_id(args.doc))
     if args.json:
         _out(args, res)
@@ -429,7 +597,7 @@ def cmd_outline(args, settings) -> int:
 
 
 def cmd_list(args, settings) -> int:
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     entries = [e for e in lib.catalog().values() if not args.tag or args.tag in e.get("tags", [])]
     if args.json:
         _out(args, entries)
@@ -446,7 +614,7 @@ def cmd_list(args, settings) -> int:
 
 
 def cmd_show(args, settings) -> int:
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     doc_id = lib.resolve_id(args.doc)
     entry = lib.catalog()[doc_id]
     doc = lib.load_doc(doc_id)
@@ -464,12 +632,16 @@ def cmd_show(args, settings) -> int:
 
 
 def cmd_remove(args, settings) -> int:
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     doc_id = lib.resolve_id(args.doc)
     title = lib.catalog()[doc_id].get("title", "")
     removed = lib.remove(doc_id)
-    sha = None if args.no_commit else lib.commit(f"remove: {title} ({doc_id})", ["."])
-    _out(args, {"doc_id": doc_id, "removed": removed, "commit": sha}, f"removed {doc_id} ({len(removed)} files)")
+    sha = None if args.no_commit else lib.commit(f"remove: {title} ({doc_id})", ["."], push=not args.no_push)
+    _out(
+        args,
+        {"doc_id": doc_id, "removed": removed, "commit": sha, "push": lib.last_push},
+        f"removed {doc_id} ({len(removed)} files)" + (f"; {_push_text(lib.last_push)}" if lib.last_push else ""),
+    )
     return EXIT_OK
 
 
@@ -477,7 +649,7 @@ def cmd_reindex(args, settings) -> int:
     from .ingest import rechunk
     from .search import SearchIndex
 
-    lib = _lib(args, settings).require()
+    lib = _guarded(args, settings)
     n_chunks = None
     if args.rechunk:
         ids = [lib.resolve_id(d) for d in args.doc] if args.doc else sorted(lib.catalog())
@@ -534,15 +706,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("init", parents=[common], help="create a library (git repo) at --library")
     s.add_argument("--no-git", action="store_true")
+    s.add_argument("--remote", help="add this git remote (must be private) and push")
+    s.add_argument("--github", metavar="OWNER/NAME", help="create (or reuse) a PRIVATE GitHub repo via gh and push")
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("doctor", parents=[common], help="check configuration, keys and tools")
     s.add_argument("--ping", action="store_true", help="send a tiny request to the configured LLM")
     s.set_defaults(func=cmd_doctor)
 
-    s = sub.add_parser("config", parents=[common], help="show resolved config (secrets masked)")
-    s.add_argument("--init", action="store_true", help="write a commented template config file")
+    s = sub.add_parser(
+        "config",
+        parents=[common],
+        help="show config, or set/unset a value (library config by default)",
+        description="Library config (.pdfskill/config.toml) is committed and pushed with the library; the library's "
+        "remotes are verified private before anything is written. Use --user for the per-machine config.",
+    )
+    s.add_argument("action", nargs="?", default="show", choices=["show", "set", "unset", "init"])
+    s.add_argument("key", nargs="?", help="e.g. mineru.token, llm.provider, llm.model, keys.DEEPSEEK_API_KEY")
+    s.add_argument("value", nargs="?", help="value, or '-' to read it from stdin (keeps it out of shell history)")
+    s.add_argument("--user", action="store_true", help="write the per-machine user config instead")
+    s.add_argument("--no-commit", action="store_true")
+    s.add_argument("--no-push", action="store_true")
     s.set_defaults(func=cmd_config)
+
+    s = sub.add_parser("remote", parents=[common], help="library remotes: status | add URL | create OWNER/NAME")
+    s.add_argument("action", choices=["status", "add", "create"])
+    s.add_argument("target", nargs="?", help="URL for add, OWNER/NAME for create (private GitHub repo via gh)")
+    s.add_argument("--name", default="origin")
+    s.set_defaults(func=cmd_remote)
+
+    s = sub.add_parser("sync", parents=[common], help="pull --rebase and push the library (remotes must be private)")
+    s.set_defaults(func=cmd_sync)
 
     s = sub.add_parser("providers", parents=[common], help="list built-in LLM providers")
     s.set_defaults(func=cmd_providers)
@@ -574,6 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--init", action="store_true", help="initialise the library if missing")
         s.add_argument("--force", action="store_true", help="redo conversion (and translation)")
         s.add_argument("--no-commit", action="store_true", help="do not git-commit the library")
+        s.add_argument("--no-push", action="store_true", help="commit but do not push")
         s.add_argument(
             "--render-mode",
             choices=["auto", "overlay", "typst", "typst_visual", "dual"],
@@ -631,6 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("remove", parents=[common], help="delete a document and its unused assets")
     s.add_argument("doc")
     s.add_argument("--no-commit", action="store_true")
+    s.add_argument("--no-push", action="store_true")
     s.set_defaults(func=cmd_remove)
 
     s = sub.add_parser("reindex", parents=[common], help="rebuild the BM25 index")
@@ -649,10 +845,13 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "func", None):
         parser.print_help()
         return EXIT_USAGE
-    settings = load_settings()
     try:
+        settings = load_settings()
+        lib = Library.find(Path(args.library) if args.library else None, settings.library)
+        if lib.exists:  # library config (may hold keys) sits between env vars and the user config
+            settings = load_settings(lib.root)
         return args.func(args, settings)
-    except (LibraryError, LLMError, tr.TranslateError) as exc:
+    except (LibraryError, LLMError, tr.TranslateError, PrivacyError, ConfigError) as exc:
         if args.json:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         else:

@@ -25,6 +25,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from . import privacy
+
 MARKER_DIR = ".pdfskill"
 DEFAULT_LIBRARY = Path("~/pdfskill-library").expanduser()
 
@@ -63,7 +65,11 @@ Managed by [pdf-skill](https://github.com/Uniseem/pdf-skill). Layout:
 - `assets/`: images named by content hash
 - `chunks/`: plain-text search chunks (BM25 index is rebuilt into `.cache/`)
 
-Search with `pdfskill search "<query>"`, read with `pdfskill get <id> --page N`.
+Search with `pdfskill search "<query>"`, read with `pdfskill get <id> --pages N`.
+
+**Keep this repository private.** `.pdfskill/config.toml` may hold API keys.
+pdfskill refuses to run, and its git pre-push hook refuses to push, when a remote
+is publicly readable.
 """
 
 
@@ -154,6 +160,8 @@ class Library:
     # -- init ----------------------------------------------------------------------------------
 
     def init(self, *, git: bool = True) -> list[str]:
+        if self.is_git:  # an existing repository: refuse before writing anything if it is public
+            self.guard()
         created: list[str] = []
         for d in (self.root / MARKER_DIR, self.docs_dir, self.assets_dir, self.chunks_dir):
             if not d.exists():
@@ -177,10 +185,12 @@ class Library:
             self.catalog_path.write_text("", encoding="utf-8")
             created.append("catalog.jsonl")
         if git and shutil.which("git") and not (self.root / ".git").exists():
-            self._git("init", "-q")
+            self._git("init", "-q", "-b", "main")
             created.append(".git/")
+        if git and self.is_git:
+            privacy.install_hook(self.root)
         if git and self.is_git and created:
-            self.commit("init pdfskill library", ["."])
+            self.commit("init pdfskill library", ["."], push=False)
         return created
 
     # -- catalog -------------------------------------------------------------------------------
@@ -288,8 +298,13 @@ class Library:
     def _git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(["git", "-C", str(self.root), *args], check=check, capture_output=True, text=True)
 
-    def commit(self, message: str, paths: list[str]) -> str | None:
-        """Stage ``paths`` (relative to the root) and commit; return the short sha or None."""
+    def commit(self, message: str, paths: list[str], *, push: bool = True) -> str | None:
+        """Stage ``paths`` (relative to the root), commit, and push if a remote exists.
+
+        Returns the short sha, or None when there was nothing to commit. Push results
+        are recorded in :attr:`last_push`.
+        """
+        self.last_push = None
         if not self.is_git:
             return None
         self._git("add", "-A", "--", *paths)
@@ -300,7 +315,78 @@ class Library:
         if not env_ok:
             args = ["-c", "user.name=pdfskill", "-c", "user.email=pdfskill@localhost", *args]
         self._git(*args)
-        return self._git("rev-parse", "--short", "HEAD").stdout.strip()
+        sha = self._git("rev-parse", "--short", "HEAD").stdout.strip()
+        if push and self.remote_names():
+            self.last_push = self.push()
+        return sha
+
+    # -- privacy and remotes -------------------------------------------------------------------
+
+    last_push: dict | None = None
+
+    def remote_names(self) -> list[str]:
+        if not self.is_git:
+            return []
+        return [r for r in self._git("remote", check=False).stdout.split() if r]
+
+    def privacy_status(self, *, fresh: bool = False) -> list[privacy.RemoteStatus]:
+        return privacy.check_library(self.root, fresh=fresh, cache_file=self.cache_dir / "privacy.json")
+
+    def guard(self, *, strict: bool = False) -> list[privacy.RemoteStatus]:
+        """Refuse to work on a library with a publicly readable remote.
+
+        ``strict`` (before writing keys or pushing) re-checks without the cache and also
+        refuses remotes whose visibility cannot be verified.
+        """
+        if not self.is_git:
+            return []
+        privacy.install_hook(self.root)
+        statuses = self.privacy_status(fresh=strict)
+        privacy.enforce(statuses, strict=strict)
+        return statuses
+
+    def push(self, remote: str | None = None) -> dict:
+        """Push the current branch after a fresh privacy check; never raises for network errors."""
+        names = self.remote_names()
+        remote = remote or ("origin" if "origin" in names else (names[0] if names else None))
+        if not remote:
+            return {"pushed": False, "reason": "no remote"}
+        self.guard(strict=True)
+        branch = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
+        proc = self._git("push", "-q", "-u", remote, branch, check=False)
+        if proc.returncode != 0:
+            return {"pushed": False, "remote": remote, "reason": (proc.stderr.strip().splitlines() or ["?"])[-1][:300]}
+        return {"pushed": True, "remote": remote, "branch": branch}
+
+    def add_remote(self, url: str, name: str = "origin") -> dict:
+        """Add a remote only after verifying it is private, then push."""
+        if not self.is_git:
+            raise LibraryError("the library is not a git repository (run `pdfskill init`)")
+        st = privacy.check_url(name, url)
+        privacy.enforce([st], strict=True)
+        if name in self.remote_names():
+            self._git("remote", "set-url", name, url)
+        else:
+            self._git("remote", "add", name, url)
+        privacy.install_hook(self.root)
+        return {"remote": name, "url": privacy.redact(url), "status": st.status, "push": self.push(name)}
+
+    def sync(self) -> dict:
+        """Pull (rebase) then push, after a fresh privacy check."""
+        names = self.remote_names()
+        if not names:
+            raise LibraryError("no remote configured; add one with `pdfskill remote add URL`")
+        self.guard(strict=True)
+        remote = "origin" if "origin" in names else names[0]
+        branch = self._git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "main"
+        has_upstream = self._git("ls-remote", "--exit-code", "--heads", remote, branch, check=False).returncode == 0
+        pulled = None
+        if has_upstream:
+            proc = self._git("pull", "-q", "--rebase", "--autostash", remote, branch, check=False)
+            if proc.returncode != 0:
+                raise LibraryError(f"git pull failed: {proc.stderr.strip()[-300:]}")
+            pulled = True
+        return {"pulled": pulled, "push": self.push(remote)}
 
 
 def _atomic_write(path: Path, text: str) -> None:

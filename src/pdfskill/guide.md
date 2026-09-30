@@ -13,22 +13,31 @@ One CLI, `pdfskill`, runs three jobs. It keeps a local **document library**, whi
    - A JSON lookup for pages, headings and captions.
    - Exact Markdown ranges for reading.
 
+**The library holds API keys and is pushed to its git remote, so it must be private.** pdfskill enforces this:
+- Every command refuses to run while any remote of the library is publicly readable.
+- Keys are written and pushes are made only after a fresh check that every remote is private.
+- A git pre-push hook blocks manual `git push` to a public remote.
+
 ## Setup (once per machine)
 
 1. Check the tool: `pdfskill --version`.
    - If it is missing, install it: `uv tool install git+https://github.com/Uniseem/pdf-skill`. This needs uv: https://docs.astral.sh/uv/.
    - For a one-off run without installing: `uvx --from git+https://github.com/Uniseem/pdf-skill pdfskill ...`.
-2. Run `pdfskill doctor`. It reports what is missing. Tell the user which environment variable to set, and never ask them to paste a secret into the chat.
-   - **MinerU**: `MINERU_TOKEN` (from https://mineru.net/apiManage/token). Without it, the anonymous, rate-limited MinerU API is used.
-   - **LLM**: any OpenAI-compatible provider.
-     - Set a provider key such as `DEEPSEEK_API_KEY`, `DASHSCOPE_API_KEY`, `ZHIPUAI_API_KEY`, `MOONSHOT_API_KEY`, `SILICONFLOW_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. `pdfskill providers` lists them all.
-     - Optional overrides: `PDFSKILL_LLM_PROVIDER`, `PDFSKILL_LLM_MODEL`, and `PDFSKILL_LLM_BASE_URL` for any other endpoint.
-     - Keys can also go in `~/.config/pdfskill/config.toml`; `pdfskill config --init` writes a template.
-     - Without an LLM, ingest still works and produces heuristic Markdown.
-3. Create the library: `pdfskill init`.
-   - The default location is `~/pdfskill-library`. Choose another with `--library PATH` or `PDFSKILL_LIBRARY`.
-   - A directory that contains `.pdfskill/` is found automatically from inside it.
-4. Translation only: `pdfskill setup translate`. It installs the retain-pdf environment, typst and CJK fonts, about 200 MB.
+2. Create the library with a private remote, or clone an existing one:
+   - `pdfskill init --github OWNER/NAME` creates (or reuses) a **private** GitHub repository through `gh`, then pushes to it.
+   - `pdfskill init --remote URL` uses any other git host; the URL must not be publicly readable.
+   - `pdfskill init` alone gives a local-only library. Add a remote later with `pdfskill remote add URL` or `pdfskill remote create OWNER/NAME`.
+   - The default location is `~/pdfskill-library`. Choose another with `--library PATH` or `PDFSKILL_LIBRARY`. A directory that contains `.pdfskill/` is found automatically from inside it.
+   - On another machine, `git clone` the private library and run any pdfskill command inside it. The command installs the push hook.
+3. Store the keys in the library, where they are committed and pushed with it. Ask the user to run these in their own terminal; `-` reads the value from stdin:
+   - `pdfskill config set mineru.token -` sets the MinerU token (from https://mineru.net/apiManage/token). Without a token, the anonymous, rate-limited MinerU API is used.
+   - `pdfskill config set keys.DEEPSEEK_API_KEY -` sets a provider key. Any provider's variable works, such as `DASHSCOPE_API_KEY`, `ZHIPUAI_API_KEY`, `MOONSHOT_API_KEY`, `SILICONFLOW_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. `pdfskill providers` lists them all.
+   - Optional: `pdfskill config set llm.provider deepseek`, `pdfskill config set llm.model deepseek-chat`, and `llm.base_url` for any other OpenAI-compatible endpoint.
+   - Order of precedence: environment variables, then the library config, then the per-machine user config (`--user`, `~/.config/pdfskill/config.toml`).
+   - Without an LLM, ingest still works and produces heuristic Markdown.
+   - If the user pastes a key into the chat, you may run `pdfskill config set` with it, but never echo it back or write it anywhere else.
+4. Run `pdfskill doctor`. It reports missing keys and tools, and the privacy status of every remote.
+5. Translation only: `pdfskill setup translate`. It installs the retain-pdf environment, typst and CJK fonts, about 200 MB.
 
 ## Ingest
 
@@ -41,7 +50,7 @@ pdfskill ingest paper.pdf --translate          # ingest + Chinese translation (P
 ```
 
 - Output: one line per file with the `doc_id` (16 hex characters), title, page count and whether the Markdown passed strict validation. Add `--json` for details.
-- Each ingest commits to the library's git repository (`--no-commit` to skip).
+- Each ingest commits to the library's git repository and pushes it to the private remote. Use `--no-push` or `--no-commit` to skip either step.
 - Re-ingesting the same file is a no-op. The file is identified by its content hash.
 - `--force` re-converts using the cached MinerU result. `--reparse` calls MinerU again.
 - Long documents take minutes because the LLM refines them chunk by chunk. For large batches, run the command in the background and check its output.
@@ -93,6 +102,9 @@ chunks/<id>[.zh].jsonl     search chunks (committed); the BM25 index is rebuilt 
 
 ## Rules for agents
 
+- **Never make the library public.** Never add a public remote. Never bypass the push hook with `--no-verify`. Never copy `.pdfskill/config.toml` or keys anywhere else.
+- If a command fails because a remote is publicly readable, stop and tell the user. The fix is to make that repository private (for example `gh repo edit OWNER/NAME --visibility private`) and to rotate any keys that were pushed. Do not work around the check.
+- Run `pdfskill sync` to pull changes made on other machines and push local ones.
 - Use `--json` whenever you parse output. Progress is printed on stderr, data on stdout.
 - Do not read whole documents into context. Search, then `get` the relevant pages or sections. `get` truncates at 20 000 characters; adjust with `--max-chars`.
 - If ingest reports validation issues, the Markdown is still usable. `pdfskill show <doc> --json` lists them.

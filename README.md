@@ -34,8 +34,9 @@ flowchart TD
 
 ```bash
 uv tool install git+https://github.com/Uniseem/pdf-skill     # 安装 pdfskill 命令
-pdfskill doctor                                              # 检查配置
-pdfskill init                                                # 创建文档库（默认 ~/pdfskill-library）
+pdfskill init --github OWNER/my-library                      # 创建文档库（默认 ~/pdfskill-library）+ 私有 GitHub 仓库
+pdfskill config set keys.DEEPSEEK_API_KEY -                  # key 存进文档库（仓库必须私有）
+pdfskill doctor                                              # 检查配置和远端的隐私状态
 pdfskill setup translate                                     # 可选：翻译环境（retain-pdf + typst + 字体，约 200 MB）
 ```
 
@@ -53,16 +54,46 @@ skill 目录是 [`skills/pdf-skill`](skills/pdf-skill/SKILL.md)，它调用的�
 | 手动 | 把 `skills/pdf-skill` 复制到 `~/.agents/skills/`（Claude Code 用 `~/.claude/skills/`） |
 | 不支持 skill 的 agent | 把 [docs/agents-md-snippet.md](docs/agents-md-snippet.md) 的内容贴进 `AGENTS.md` |
 
+## 文档库必须是私有仓库（强制）
+
+API key 存在文档库里（`.pdfskill/config.toml`），会随文档库一起提交、推送。所以**文档库只能放在私有仓库**，由 pdfskill 强制保证：
+
+- **每条命令都会检查**：只要文档库的任何一个远端能被匿名读取，命令就拒绝执行，并给出修复方法（比如 `gh repo edit OWNER/NAME --visibility private`），同时提醒你轮换已经推送出去的 key。
+  - 例外是 `doctor` 和 `remote status`，它们仍然能运行，方便排查。
+  - 这个检查结果会缓存 1 小时。
+- **写 key 或推送之前一律现场重查**，不用缓存。无法确认是否私有时（比如离线），也拒绝执行。
+- **判断方法**：
+  - GitHub 远端：通过已登录的 `gh`（或 `GITHUB_TOKEN`）查询，可见性必须是 `private`，`internal` 也不算。
+  - 所有远端：再做一次**完全匿名**的 `git ls-remote`。这次探测不读系统和全局 git 配置、不用任何凭据 helper、不弹提示。只要匿名能读到，就判定为公开。
+  - 本地路径的远端视为安全。
+- **git pre-push hook**：用纯 shell 实现，不依赖 pdfskill。你手动 `git push` 到公开仓库也会被拦下。这个 hook 会串联你原有的 pre-push hook；被删掉后，下次运行任何 pdfskill 命令都会自动装回。
+- 即使一开始没有配远端，以后再加的远端同样会经过上面这些检查。
+
+```bash
+pdfskill init --github Uniseem/my-library   # 用 gh 新建（或复用）一个私有 GitHub 仓库并推送
+pdfskill init --remote git@git.example.com:me/lib.git   # 其他平台：地址不能匿名可读
+pdfskill remote status                      # 查看每个远端的隐私状态
+pdfskill sync                               # 多台机器之间同步（pull --rebase + push）
+```
+
 ## 配置
 
-密钥只从环境变量或用户配置文件 `~/.config/pdfskill/config.toml` 读取，**永远不会写进文档库**。`pdfskill config --init` 会生成一份带注释的模板。
+读取优先级：**环境变量 > 文档库配置（`.pdfskill/config.toml`，随仓库同步）> 用户配置（`~/.config/pdfskill/config.toml`，只在本机，加 `--user` 写入）**。
 
-| 用途 | 环境变量 | 说明 |
+```bash
+pdfskill config set mineru.token -                # 值从 stdin 读取，不会留在 shell 历史里
+pdfskill config set keys.DEEPSEEK_API_KEY -       # [keys] 表：用环境变量名存任意一家服务的 key
+pdfskill config set llm.provider deepseek
+pdfskill config set llm.model deepseek-chat
+pdfskill config                                   # 查看最终生效的配置（key 打码显示）
+```
+
+| 用途 | 配置项 / 环境变量 | 说明 |
 | --- | --- | --- |
-| MinerU | `MINERU_TOKEN` | 在 <https://mineru.net/apiManage/token> 申请。没有 token 时自动改用匿名 v1 接口，限流较严 |
-| LLM | `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`ZHIPUAI_API_KEY`、`MOONSHOT_API_KEY`、`SILICONFLOW_API_KEY`、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`ARK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等 | 按 `pdfskill providers` 的列出顺序，取第一个在环境中找到的 key。内置 22 个服务预设 |
-| 指定模型 | `PDFSKILL_LLM_PROVIDER`、`PDFSKILL_LLM_MODEL`、`PDFSKILL_LLM_BASE_URL`、`PDFSKILL_LLM_API_KEY` | `BASE_URL` 可以指向任意 OpenAI 兼容端点，包括 Ollama、vLLM、LM Studio 等本地服务 |
-| 文档库位置 | `PDFSKILL_LIBRARY` | 也可以用 `--library` 指定；在含 `.pdfskill/` 的目录内运行时自动识别 |
+| MinerU | `mineru.token` / `MINERU_TOKEN` | 在 <https://mineru.net/apiManage/token> 申请。没有 token 时自动改用匿名 v1 接口，限流较严 |
+| LLM key | `keys.<变量名>` / `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`、`ZHIPUAI_API_KEY`、`MOONSHOT_API_KEY`、`SILICONFLOW_API_KEY`、`OPENROUTER_API_KEY`、`GEMINI_API_KEY`、`ARK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY` 等 | 按 `pdfskill providers` 的列出顺序，取第一个能找到 key 的服务。内置 22 个服务预设 |
+| 指定模型 | `llm.provider`、`llm.model`、`llm.base_url`、`llm.api_key` / `PDFSKILL_LLM_*` | `base_url` 可以指向任意 OpenAI 兼容端点，包括 Ollama、vLLM、LM Studio 等本地服务 |
+| 文档库位置 | `library.path`（只能写在用户配置里）/ `PDFSKILL_LIBRARY` | 也可以用 `--library` 指定；在含 `.pdfskill/` 的目录内运行时自动识别 |
 
 没有配置 LLM 时仍可入库：标题层级靠编号规则推断，排版做确定性清理，输出同样通过严格校验。翻译必须配置 LLM。
 
@@ -82,7 +113,7 @@ pdfskill get 40ae --pages 3                # 按页精读
 pdfskill get 40ae --heading "Benchmarks"   # 按章节精读
 pdfskill get 40ae6d1eeb06ed5d#0005         # 读检索命中的 chunk
 pdfskill get 40ae --pages 3 --in zh        # 读译文
-pdfskill list | show <doc> | remove <doc> | reindex [--rechunk]
+pdfskill list | show <doc> | remove <doc> | reindex [--rechunk] | sync
 ```
 
 所有命令都支持 `--json`：数据输出到 stdout，进度输出到 stderr。
@@ -91,6 +122,7 @@ pdfskill list | show <doc> | remove <doc> | reindex [--rechunk]
 
 ```text
 <library>/
+├── .pdfskill/config.toml    # 设置和 API key（随仓库同步，所以仓库必须私有）
 ├── catalog.jsonl            # 每篇文档一行，按 id 排序
 ├── docs/<id>.md             # 分层 Markdown：唯一 H1、标题不跳级、公式通过 KaTeX、GFM 表格
 ├── docs/<id>.json           # 页面尺寸、目录、块（类型/页码/bbox/预览/Markdown 行号）
@@ -132,7 +164,7 @@ pdfskill list | show <doc> | remove <doc> | reindex [--rechunk]
 ## 限制
 
 - retain-pdf 只支持**翻译成简体中文**，且只能翻译 PDF 输入。
-- MinerU 单个文件不超过 200 页、200 MB。更长的文档用 `--pages` 分段入库。
+- MinerU 单个文件不超过 200 页、200 MB，更长的文档用 `--pages` 分段入库。匿名接口对同一个文件只允许解析几次；pdfskill 会缓存解析结果，但长期使用请配置 token。
 - 译文 PDF 会直接提交进 git，默认把图片压到 150 dpi，用 `--compress-dpi` 调整。
 - 翻译环境里的 PyMuPDF 是 AGPL 许可，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
@@ -141,6 +173,7 @@ pdfskill list | show <doc> | remove <doc> | reindex [--rechunk]
 ```bash
 uv sync
 uv run pytest            # 离线测试：MinerU 请求用 httpx MockTransport，LLM 用 tests/mock_llm.py
+PDFSKILL_NETWORK_TESTS=1 uv run pytest   # 加上真实的仓库可见性检查（只用 dry-run 推送）
 uv run ruff check src tests
 uvx --from skills-ref==0.1.1 agentskills validate skills/pdf-skill
 ```

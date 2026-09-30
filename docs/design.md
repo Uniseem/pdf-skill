@@ -147,6 +147,24 @@ file ──sha256──► doc_id ──► MinerU（v4 带 token / v1 匿名）
   - retain-pdf 会把跨栏、跨页的段落合成一个单元来翻译。这时整段译文放在第一个块上，其余块留空；如果单元里含有标题，就按成员各自拆分。
 - **限制**：目标语言在上游代码里写死为简体中文；表格标题上游不翻译，保留原文。
 
+### 私有仓库约束（key 随文档库同步）
+
+需求变更：API key 要跟着文档库一起推送，所以文档库只能放在私有仓库。实现为四层，缺一层都会留下漏洞：
+
+1. **key 的存放位置**：写在 `.pdfskill/config.toml`，文件权限 0600，提交信息里不含 key 的值，所有输出都打码。读取优先级是环境变量 > 文档库配置 > 用户配置。
+2. **每条命令先检查**：`Library.guard()` 检查所有远端（不只 origin），发现公开的就拒绝执行。“私有”的结论缓存 1 小时；“公开”和“无法判断”不缓存，每次都重新检查。
+3. **写 key 和推送前严格检查**：`guard(strict=True)` 不用缓存，现场重查；“无法判断”也按不安全处理。`init` 遇到已有公开远端的仓库也会拒绝，不写任何文件。
+4. **pre-push hook**：纯 POSIX shell 实现，所以 pdfskill 升级、卸载或换了 Python 环境都不影响它。它在 `/` 目录下、清空 `GIT_*` 环境后做匿名探测，避免读到仓库本地配置里的凭据（例如 CI checkout 留下的 extraheader）。它会串联用户原有的 hook，并原样转发 stdin。
+
+判断“是否私有”的方法：
+
+- **GitHub**：用已登录的 `gh api repos/O/R --jq .visibility`，必须是 `private`，`internal` 不算。
+- **所有远端**：再做一次完全匿名的 `git ls-remote`（`GIT_CONFIG_NOSYSTEM=1`、`GIT_CONFIG_GLOBAL=/dev/null`、`-c credential.helper=`、`GIT_TERMINAL_PROMPT=0`），能读到就是公开。
+- 在本机实测（本机配有 osxkeychain 和 gh 两个凭据 helper）：隔离后探测私有仓库失败、公开仓库成功；不隔离时私有仓库也能读到。这说明隔离是必要的。
+- 匿名探测无法区分“私有”和“不存在”，两者都按安全处理：不存在的仓库推送时会失败，不会泄露。
+
+测试上的一个坑：往**没有写权限**的公开仓库推送时，GitHub 在握手阶段就返回 403，pre-push hook 根本来不及运行，用它测试 hook 是无效的。正确做法是往有写权限的公开仓库执行 `git push --dry-run`：hook 会照常运行，但永远不会真正发送数据（`tests/test_privacy.py::test_real_hook_blocks_public_push`）。
+
 ### 跨 agent 分发
 
 - **skill 目录**：遵循 agentskills.io 规范，frontmatter 只用规范定义的六个字段，已通过 `skills-ref validate`。skill 目录只放说明文件，代码作为 CLI 安装，因为 `npx skills`、`gh skill` 这类安装器只复制 skill 目录本身。

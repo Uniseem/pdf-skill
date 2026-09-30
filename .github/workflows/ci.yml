@@ -21,5 +21,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check src tests
       - run: uv run pytest -q
+        env:
+          PDFSKILL_NETWORK_TESTS: "1"
       - run: uvx --from skills-ref==0.1.1 agentskills validate skills/pdf-skill
       - run: uv build
