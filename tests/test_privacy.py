@@ -163,8 +163,29 @@ def test_real_visibility_checks():
 
 
 @pytest.mark.skipif(not NETWORK, reason="set PDFSKILL_NETWORK_TESTS=1")
+def test_real_hook_script_rejects_public_url(library):
+    """Run the installed hook exactly as git does (remote name, URL, ref lines on stdin)."""
+    hook = privacy.hooks_dir(library.root) / "pre-push"
+    refs = "refs/heads/main 1111111111111111111111111111111111111111 refs/heads/x " + "0" * 40 + "\n"
+    for url in ("https://github.com/octocat/Hello-World.git", "git@github.com:octocat/Hello-World.git"):
+        proc = subprocess.run([str(hook), "origin", url], input=refs, capture_output=True, text=True, cwd=library.root)
+        assert proc.returncode == 1 and "push refused" in proc.stderr, (url, proc.stderr)
+    proc = subprocess.run(
+        [str(hook), "origin", "https://github.com/octocat/pdfskill-no-such-repo-xyz.git"],
+        input=refs,
+        capture_output=True,
+        text=True,
+        cwd=library.root,
+    )
+    assert proc.returncode == 0
+
+
+@pytest.mark.skipif(not NETWORK, reason="set PDFSKILL_NETWORK_TESTS=1")
 def test_real_hook_blocks_public_push(library):
-    """--dry-run: the hook runs, nothing is ever sent."""
+    """--dry-run: the hook runs, nothing is ever sent. Needs push rights to the public repo:
+    without credentials git fails during the handshake, before any hook runs."""
     git(library.root, "remote", "add", "pub", "https://github.com/Uniseem/pdf-skill.git")
     proc = git(library.root, "push", "--dry-run", "pub", "HEAD:refs/heads/pdfskill-hook-test", check=False)
+    if "could not read Username" in proc.stderr or "Permission to" in proc.stderr:
+        pytest.skip("no push credentials for github.com here; git stops before running hooks")
     assert proc.returncode != 0 and "push refused" in proc.stderr
